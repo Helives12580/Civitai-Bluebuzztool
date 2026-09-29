@@ -1,0 +1,12 @@
+# 运行时数据：里面有明文的 civitai API Key，绝不入库、绝不随包分发
+data/
+
+# 依赖（本工具零依赖，出现即为误装）
+node_modules/
+
+# 编辑器 / 系统
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+*.log

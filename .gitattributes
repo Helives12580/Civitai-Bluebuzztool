@@ -1,0 +1,5 @@
+# 换行符策略：默认 LF（跨平台友好），Windows 批处理强制 CRLF。
+# start.bat 若是 LF 结尾，cmd 在部分场景（label / goto）会解析异常，所以必须钉死。
+* text=auto eol=lf
+*.bat text eol=crlf
+*.cmd text eol=crlf
