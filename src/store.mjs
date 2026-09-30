@@ -182,7 +182,15 @@ export class Store {
     const day = utcDayKey();
     let s = this.#state.accounts[accountId];
     if (!s || s.day !== day) {
-      s = { day, counters: {}, earned: 0, lastRunAt: null, lastResult: null };
+      s = {
+        day,
+        counters: {},
+        earned: 0,            // 本工具按任务定义累加的「我做了多少」（理论值）
+        siteEarned: null,     // 站点流水实测的「站点给了多少」（权威值），未扫描过则为 null
+        siteEarnedByType: {},
+        lastRunAt: null,
+        lastResult: null,
+      };
       this.#state.accounts[accountId] = s;
       this.#writeJson(this.#statePath, this.#state);
     }
@@ -193,6 +201,24 @@ export class Store {
     const s = this.dayState(accountId);
     s.counters[type] = (s.counters[type] ?? 0) + count;
     s.earned = (s.earned ?? 0) + earned;
+    this.#writeJson(this.#statePath, this.#state);
+    return s;
+  }
+
+  /**
+   * 记下「站点侧今日已得」——来自交易流水，是权威口径。
+   *
+   * 为什么要单独存：`earned` 是本工具按任务定义累加的「我做了多少」，
+   * 不等于「站点给了多少」。撞上站点去重、日上限、或用户手动操作时，
+   * 两者会明显分叉（实测出现过理论 155 / 实到 83）。
+   * 面板顶栏必须显示站点真值，否则就是在虚报。
+   */
+  setSiteEarned(accountId, total, byType, day) {
+    const s = this.dayState(accountId);
+    s.siteEarned = total;
+    s.siteEarnedByType = byType ?? {};
+    s.siteEarnedDay = day ?? s.day;
+    s.siteEarnedAt = new Date().toISOString();
     this.#writeJson(this.#statePath, this.#state);
     return s;
   }

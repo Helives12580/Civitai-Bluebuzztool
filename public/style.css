@@ -202,6 +202,7 @@ input[type="number"] { text-align: right; }
 
 .task .meter { text-align: right; }
 .task .meter .num { font-family: var(--mono); font-size: 12.5px; color: var(--fg-dim); }
+.task .meter .sub { font-size: 10.5px; color: var(--fg-mute); margin-top: 1px; }
 .bar {
   height: 5px; border-radius: 20px; background: #232a38;
   margin-top: 6px; overflow: hidden;

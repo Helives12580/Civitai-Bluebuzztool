@@ -91,7 +91,13 @@ function daySnapshot(accountId) {
   const byType = Object.fromEntries(tasks.map((t) => [t.type, t]));
   return {
     day: day.day,
+    // 两个口径分开给，别混：earned 是「本工具做了多少」（按任务定义推算），
+    // siteEarned 是「站点给了多少」（流水实测）。面板顶栏显示后者。
     earned: day.earned ?? 0,
+    siteEarned: day.siteEarned ?? null,
+    siteEarnedByType: day.siteEarnedByType ?? {},
+    siteEarnedAt: day.siteEarnedAt ?? null,
+    siteEarnedDay: day.siteEarnedDay ?? null,
     lastRunAt: day.lastRunAt ?? null,
     lastResult: day.lastResult ?? null,
     utcResetInMs: msToUtcReset(),

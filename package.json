@@ -10,6 +10,7 @@
   },
   "scripts": {
     "start": "node server.mjs",
+    "selftest": "node scripts/selftest-reaction-dedup.mjs",
     "probe:transactions": "node scripts/probe-transactions.mjs",
     "probe:rewards": "node scripts/probe-reward-details.mjs"
   },

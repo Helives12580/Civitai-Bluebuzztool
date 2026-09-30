@@ -71,13 +71,46 @@ function fmtEarned(n) {
   return `${n > 0 ? '+' : ''}${n} buzz`;
 }
 
+/**
+ * 顶栏「今日收益」——显示**站点流水实测值**，不是本地累加的理论值。
+ *
+ * 为什么必须这样：`day.earned` 只是本工具按任务定义累加的「我做了多少」。
+ * 一旦撞上站点去重、日上限、或用户自己手动做过一部分，两者就会明显分叉
+ * （实测出现过理论 155 / 实际只到账 83）。顶栏显示理论值就是在虚报。
+ * 站点真值只在扫描/执行后可得，所以没扫过时如实显示「未扫描」。
+ */
+function renderEarned(acc) {
+  const el = $('stat-earned');
+  if (!acc) {
+    el.textContent = '—';
+    el.title = '';
+    return;
+  }
+  const site = acc.day.siteEarned;
+  const local = acc.day.earned ?? 0;
+  const stale = acc.day.siteEarnedDay && acc.day.siteEarnedDay !== acc.day.day;
+  if (typeof site === 'number' && !stale) {
+    el.textContent = `${site} buzz（站点）`;
+    el.title =
+      `站点交易流水实测，权威口径。\n` +
+      `本工具本地累计（理论）+${local} buzz —— 两者不一致通常是因为：\n` +
+      `· 站点对同一内容当天只算一次，重复操作不再给奖励\n` +
+      `· 日上限里已被你手动操作占掉一部分\n` +
+      `数据来源：${acc.day.siteEarnedAt ? new Date(acc.day.siteEarnedAt).toLocaleString('zh-CN') : '—'}`;
+  } else {
+    el.textContent = '未扫描';
+    el.title = `点「扫描当前可做任务」后可读到站点真值。\n（本地理论累计 +${local} buzz，仅供参考）`;
+  }
+}
+
 function render() {
   if (!STATE) return;
   const acc = selected();
   if (acc) selectedId = acc.id;
 
   // 顶栏
-  $('stat-earned').textContent = acc ? fmtEarned(acc.day.earned) : '—';
+  // 顶栏收益：站点真值优先
+  renderEarned(acc);
   $('stat-account').textContent = acc
     ? (acc.profile?.username ? `${acc.profile.username}` : acc.name)
     : '未添加';
@@ -241,8 +274,19 @@ function renderTasks(acc, scan) {
 
     // 未扫描时不假装知道进度：显示「未扫描」，进度条留空。
     const planned = s?.plannedEarn ?? 0;
-    const meterText = !s ? '未扫描' : s.doable ? `+${planned} · ${s.plannedCount} 次` : '跳过';
-    const pct = s?.doable && t.cap ? Math.min(100, Math.round((planned / t.cap) * 100)) : 0;
+    const meterText = !s ? '未扫描' : s.doable ? `计划 +${planned} · ${s.plannedCount} 次` : '跳过';
+
+    // 站点侧该项今日已得（来自流水）——与「计划」是两回事，分开显示，
+    // 免得把「这一轮打算做多少」误读成「已经到手多少」。
+    const siteAmt = (acc?.day?.siteEarnedByType ?? {})[t.type];
+    const siteNote =
+      typeof siteAmt === 'number' && t.capInterval === 'day' && t.cap
+        ? `站点 ${siteAmt}/${t.cap}`
+        : '';
+
+    // 进度条：有站点真值时用真值占上限的比例，否则用本轮计划
+    const shown = typeof siteAmt === 'number' ? siteAmt : planned;
+    const pct = t.cap ? Math.min(100, Math.round((shown / t.cap) * 100)) : 0;
     const msg = stepMsg.get(t.type);
     const detail = msg ?? s?.reason ?? '';
 
@@ -260,12 +304,14 @@ function renderTasks(acc, scan) {
       </div>
       <div class="meter">
         <div class="num">${meterText}</div>
+        ${siteNote ? `<div class="sub mono"></div>` : ''}
         <div class="bar"><i style="width:${pct}%"></i></div>
       </div>`;
 
     el.querySelector('.title > span').textContent = t.label;
     el.querySelector('.trigger').textContent = t.trigger + (t.note ? ` — ${t.note}` : '');
     if (detail) el.querySelector('.stepmsg').textContent = detail;
+    if (siteNote) el.querySelector('.meter .sub').textContent = siteNote;
     box.appendChild(el);
   }
 }

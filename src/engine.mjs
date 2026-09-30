@@ -36,6 +36,43 @@ function normalizeFollowing(res) {
   );
 }
 
+/** Fisher–Yates 洗牌；返回新数组，不改原数组。 */
+function shuffle(arr) {
+  const a = [...arr];
+  for (let i = a.length - 1; i > 0; i -= 1) {
+    const j = Math.floor(Math.random() * (i + 1));
+    [a[i], a[j]] = [a[j], a[i]];
+  }
+  return a;
+}
+
+/**
+ * 从交易流水里取出「今天已经给过反应的图片 ID」。
+ *
+ * 这是本工具最要紧的一个去重依据。站点对同一张图在同一天只发一次奖励：
+ * 去重键形如 `encouragement:<entityType>:<entityId>-<toUserId>-<byUserId>`
+ * （Redis 侧按 UTC 日过期），而流水把它完整写在 `details.type` / `details.forId` 里
+ * ——`externalTransactionId` 更是把整个键拼了出来：
+ *
+ *   "encouragement:image:141670819-12730169-12730169"
+ *                        ^^^^^^^^^ forId = 图片 ID
+ *
+ * 所以这里能精确还原「今天点过哪些图」，而不是靠猜。
+ *
+ * 为什么必须排除：热门榜（Most Reactions）头部是高度稳定的一批图，
+ * 而用户手动浏览时点的大概率也是这些。不排除就会撞车 ——
+ * 白点一次拿不到 buzz，却在别人的内容上留下一个真实的赞。
+ */
+export function reactedImageIds(transactions) {
+  const ids = new Set();
+  for (const t of transactions ?? []) {
+    if (!(t?.amount > 0)) continue;
+    const d = t.details;
+    if (d?.type === 'encouragement:image' && typeof d.forId === 'number') ids.add(d.forId);
+  }
+  return ids;
+}
+
 /**
  * 把请求留痕汇总成「端点 → 方法/状态码分布/次数」。
  * 用于权限侦测与站点行为核对；不包含 key、请求体与响应体。
@@ -148,39 +185,56 @@ export class BuzzEngine {
       result.notes.push(`读不到已关注列表（${describeError(e)}）——为避免误取关，本轮跳过「关注他人」。`);
     }
 
-    // 4) 反应目标池 —— 只读公开接口，确认可做次数
-    let pool = [];
-    try {
-      const list = await client.listImages({ limit: 100, sort: 'Most Reactions', period: 'Month' });
-      const me = (result.username ?? '').toLowerCase();
-      pool = (Array.isArray(list?.items) ? list.items : []).filter(
-        (i) => i?.id && (!me || i.username?.toLowerCase() !== me),
-      );
-    } catch (e) {
-      result.notes.push(`拉取图片池失败（${describeError(e)}）——本轮无法执行反应任务。`);
-    }
-
-    // 5) 站点侧今日真实收益 —— 用流水核对。
+    // 4) 站点侧今日真实收益 —— 刻意排在图片池之前，因为它顺带给出「今天点过哪些图」，
+    //    而图片池必须拿这个集合去过滤。
+    //
     //    这是整套逻辑的地基：本地计数只知道「本工具今天做没做」，而奖励额度是站点侧按 UTC 日
     //    结算的，用户手动点过的赞同样占用额度。只信本地计数就会超发 ——
     //    超发的那部分既拿不到 buzz，又对别人的内容留下了真实的点赞/关注痕迹。
     let siteRewards = null;
+    let reactedToday = new Set();
     try {
       const txs = await client.transactionsOfDay(day.day);
       const sum = summarizeRewards(txs);
       siteRewards = sum;
+      reactedToday = reactedImageIds(txs);
       result.siteRewards = {
         total: sum.total,
         byType: sum.byType,
         byTypeCount: sum.byTypeCount,
         txCount: txs.length,
         unknownCount: sum.unknown.length,
+        reactedImages: reactedToday.size,
       };
+      // 把站点真值写进 state，供面板顶栏显示 ——
+      // 本地计数是按任务定义推算的「我做了多少」，不等于「站点给了多少」。
+      this.#store.setSiteEarned(accountId, sum.total, sum.byType, day.day);
     } catch (e) {
       result.notes.push(
         `读不到今日流水（${describeError(e)}）——将退化为按本地记录估算剩余额度，可能超发；建议检查 BuzzRead 权限。`,
       );
       result.siteRewards = null;
+    }
+
+    // 5) 反应目标池 —— 只读公开接口。
+    //    拉多一点（200）便于随机抽样：热门榜头部是高度稳定的一批图，长期只取前 N 张
+    //    必然和你手动点过的重叠。再叠一层「排除今天已点过的」，双保险。
+    let pool = [];
+    let freshPool = [];
+    try {
+      const list = await client.listImages({ limit: 200, sort: 'Most Reactions', period: 'Month' });
+      const me = (result.username ?? '').toLowerCase();
+      pool = (Array.isArray(list?.items) ? list.items : []).filter(
+        (i) => i?.id && (!me || i.username?.toLowerCase() !== me),
+      );
+      freshPool = pool.filter((i) => !reactedToday.has(i.id));
+      if (reactedToday.size) {
+        result.notes.push(
+          `今日已点过 ${reactedToday.size} 张图，已从候选里排除（站点对同一张图同一天只发一次奖励，重复点只会留下痕迹、拿不到 buzz）。`,
+        );
+      }
+    } catch (e) {
+      result.notes.push(`拉取图片池失败（${describeError(e)}）——本轮无法执行反应任务。`);
     }
 
     // 5.5) 官方任务定义 —— 采信官方返回的 awardAmount / cap，覆盖本地常量。
@@ -284,7 +338,7 @@ export class BuzzEngine {
       const ceilingCount = Math.floor((def.cap ?? 100) / def.amount);
       const used = usedCount('encouragement');
       const remainCount = Math.max(0, ceilingCount - used);
-      const need = Math.min(settings.reactionTarget, remainCount, pool.length);
+      const need = Math.min(settings.reactionTarget, remainCount, freshPool.length);
       tasks.push(
         mk('encouragement', {
           doable: need > 0,
@@ -292,9 +346,9 @@ export class BuzzEngine {
           plannedEarn: need * def.amount,
           reason: remainCount === 0
             ? `今日反应额度已满（站点侧已得 ${used}/${ceilingCount} 次，含手动操作）`
-            : pool.length === 0
-              ? '没有可用的目标内容'
-              : `站点侧今日已得 ${used}/${ceilingCount} 次，计划 ${need} 次（目标池 ${pool.length} 条）`,
+            : freshPool.length === 0
+              ? `候选图里没有未点过的（池子 ${pool.length} 条，今日已点 ${reactedToday.size} 张）`
+              : `站点侧今日已得 ${used}/${ceilingCount} 次，计划 ${need} 次（未点过 ${freshPool.length} / 池子 ${pool.length} 条）`,
         }),
       );
     }
@@ -569,16 +623,39 @@ export class BuzzEngine {
     if (need <= 0) return { earned: 0, skipped: '无计划次数' };
 
     emit({ kind: 'step', type: 'encouragement', message: `拉取目标图片（需要 ${need} 张）` });
-    const list = await client.listImages({ limit: Math.min(100, need * 2), sort: 'Most Reactions', period: 'Month' });
+
+    // 拉大一点（200）再随机抽：热门榜头部是高度稳定的一批图，长期只取前 N 张，
+    // 必然和用户自己浏览时点过的重叠 —— 而那些点过了就不再给奖励。
+    const list = await client.listImages({ limit: 200, sort: 'Most Reactions', period: 'Month' });
     const items = Array.isArray(list?.items) ? list.items : [];
     const me = account.profile?.username?.toLowerCase();
     const pool = items.filter((i) => i?.id && (!me || i.username?.toLowerCase() !== me));
     if (!pool.length) return { earned: 0, error: '图片池为空，无法取得反应目标' };
 
+    // 排除「今天已经点过」的图。站点对同一张图同一天只发一次奖励，
+    // 重复点拿不到 buzz，却会在别人内容上留下真实的赞 —— 只有副作用，没有收益。
+    let usedIds = new Set();
+    try {
+      usedIds = reactedImageIds(await client.transactionsOfDay(ctx.plan?.utcDay));
+    } catch { /* 读不到流水就不排除，退化为纯随机抽样 */ }
+    const fresh = pool.filter((i) => !usedIds.has(i.id));
+    if (usedIds.size) {
+      emit({
+        kind: 'step',
+        type: 'encouragement',
+        message: `已排除今日点过的 ${usedIds.size} 张图，可用候选 ${fresh.length} 张`,
+      });
+    }
+    if (!fresh.length) {
+      return { earned: 0, skipped: `候选图今天都已点过（${pool.length} 张），重复点不会产生奖励` };
+    }
+    // 随机抽样，而不是按热度顺序取头部
+    const targets = shuffle(fresh).slice(0, need);
+
     let earned = 0;
     let count = 0;
     const errors = [];
-    for (const img of pool) {
+    for (const img of targets) {
       if (signal.aborted) break;
       if (count >= need) break;
       try {
