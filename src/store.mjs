@@ -198,8 +198,7 @@ export class Store {
   }
 
   bump(accountId, type, { count = 1, earned = 0 } = {}) {
-    const s = this.dayState(accountId);
-    s.counters[type] = (s.counters[type] ?? 0) + count;
+    const s = this.dayState(accountId);    s.counters[type] = (s.counters[type] ?? 0) + count;
     s.earned = (s.earned ?? 0) + earned;
     this.#writeJson(this.#statePath, this.#state);
     return s;
@@ -229,6 +228,33 @@ export class Store {
     s.lastResult = result;
     this.#writeJson(this.#statePath, this.#state);
     return s;
+  }
+
+  // ───────────── 反应游标（账号级，一个数字就够）─────────────
+  //
+  // 站点的奖励去重是**永久**的：同一张图拿过一次，之后任何时候再点都不再给。
+  // 所以「哪些图点过」这个问题，可以用一个单调推进的游标回答，而不是维护一张
+  // 不断膨胀的 ID 表：
+  //   每次只取 id > 游标的图 → 按 id 升序点完 → 游标前移到最后点的那张。
+  // 天然不重复，状态恒定为一个数字。
+  //
+  // 依据：/api/v1/images?sort=Oldest 返回**严格按 id 升序**（实测
+  // 2717, 2795, 2796, 2968…），而 sort=Newest 的顺序并不稳定，所以本地按 id
+  // 排序后再推进，不依赖接口的返回顺序。
+
+  getReactionCursor(accountId) {
+    const v = this.#state.reactionCursor?.[accountId];
+    return Number.isFinite(v) ? v : 0;
+  }
+
+  setReactionCursor(accountId, id) {
+    if (!this.#state.reactionCursor) this.#state.reactionCursor = {};
+    const cur = this.getReactionCursor(accountId);
+    const next = Number(id);
+    if (!Number.isFinite(next) || next <= cur) return cur;   // 只前进，不回退
+    this.#state.reactionCursor[accountId] = next;
+    this.#writeJson(this.#statePath, this.#state);
+    return next;
   }
 
   resetDay(accountId) {

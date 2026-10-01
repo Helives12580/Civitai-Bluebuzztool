@@ -36,32 +36,20 @@ function normalizeFollowing(res) {
   );
 }
 
-/** Fisher–Yates 洗牌；返回新数组，不改原数组。 */
-function shuffle(arr) {
-  const a = [...arr];
-  for (let i = a.length - 1; i > 0; i -= 1) {
-    const j = Math.floor(Math.random() * (i + 1));
-    [a[i], a[j]] = [a[j], a[i]];
-  }
-  return a;
-}
-
 /**
  * 从交易流水里取出「今天已经给过反应的图片 ID」。
  *
- * 这是本工具最要紧的一个去重依据。站点对同一张图在同一天只发一次奖励：
- * 去重键形如 `encouragement:<entityType>:<entityId>-<toUserId>-<byUserId>`
- * （Redis 侧按 UTC 日过期），而流水把它完整写在 `details.type` / `details.forId` 里
- * ——`externalTransactionId` 更是把整个键拼了出来：
+ * 用途是补游标的盲区：游标只知道**本工具**点到哪了，而用户自己手动浏览时点的赞
+ * 不经过游标。今日流水正好覆盖这一类，避免当天撞车。
+ *
+ * 站点的去重键形如 `encouragement:<entityType>:<entityId>-<toUserId>-<byUserId>`
+ * （Redis 侧按 UTC 日过期，ClickHouse 侧永久），而流水把它完整写在
+ * `details.type` / `details.forId` 里 —— `externalTransactionId` 更是把整个键拼了出来：
  *
  *   "encouragement:image:141670819-12730169-12730169"
  *                        ^^^^^^^^^ forId = 图片 ID
  *
- * 所以这里能精确还原「今天点过哪些图」，而不是靠猜。
- *
- * 为什么必须排除：热门榜（Most Reactions）头部是高度稳定的一批图，
- * 而用户手动浏览时点的大概率也是这些。不排除就会撞车 ——
- * 白点一次拿不到 buzz，却在别人的内容上留下一个真实的赞。
+ * 所以这里能精确还原，而不是靠猜。
  */
 export function reactedImageIds(transactions) {
   const ids = new Set();
@@ -216,25 +204,44 @@ export class BuzzEngine {
       result.siteRewards = null;
     }
 
-    // 5) 反应目标池 —— 只读公开接口。
-    //    拉多一点（200）便于随机抽样：热门榜头部是高度稳定的一批图，长期只取前 N 张
-    //    必然和你手动点过的重叠。再叠一层「排除今天已点过的」，双保险。
+    // 4.5) 反应游标 —— 一个数字解决「永不重复」。
+    //
+    //      站点的奖励去重是**永久**的（实测：最近 30 天 150 张图，没有一张跨日重复获奖），
+    //      而维护「所有点过的 ID」会无限膨胀、还会被流水查询的 limit 截断（实测就漏了）。
+    //      改用一个单调推进的游标：每次只取 id > 游标的图，按 id 升序点完，游标前移到
+    //      最后那张。状态恒为一个数字，且天然不重复。
+    const cursor = this.#store.getReactionCursor(accountId);
+
+    // 5) 反应目标池。
+    //    用 Newest 拉最新的一批，再**本地按 id 升序**取「游标之后最旧的那些」，
+    //    不依赖接口返回顺序（实测 sort=Newest 的顺序并不稳定，sort=Oldest 才严格升序）。
     let pool = [];
     let freshPool = [];
     try {
-      const list = await client.listImages({ limit: 200, sort: 'Most Reactions', period: 'Month' });
+      const list = await client.listImages({ limit: 200, sort: 'Newest' });
       const me = (result.username ?? '').toLowerCase();
       pool = (Array.isArray(list?.items) ? list.items : []).filter(
         (i) => i?.id && (!me || i.username?.toLowerCase() !== me),
       );
-      freshPool = pool.filter((i) => !reactedToday.has(i.id));
-      if (reactedToday.size) {
-        result.notes.push(
-          `今日已点过 ${reactedToday.size} 张图，已从候选里排除（站点对同一张图同一天只发一次奖励，重复点只会留下痕迹、拿不到 buzz）。`,
-        );
-      }
+      const afterCursor = pool.filter((i) => i.id > cursor).sort((a, b) => a.id - b.id);
+      // 再排除今日流水里点过的 —— 那些是用户手动操作的，游标看不到
+      freshPool = afterCursor.filter((i) => !reactedToday.has(i.id));
+      result.poolStats = {
+        fetched: pool.length,
+        cursor,
+        afterCursor: afterCursor.length,
+        todayReacted: reactedToday.size,
+        fresh: freshPool.length,
+      };
     } catch (e) {
-      result.notes.push(`拉取图片池失败（${describeError(e)}）——本轮无法执行反应任务。`);
+      // 这个接口的 503 很常见（实测约一半），重试后仍失败时要说清是站点过载，
+      // 而不是含糊地报「无法执行反应任务」—— 前者重扫即可，后者像是功能坏了。
+      const overloaded = e?.status === 503 || /overloaded|retry/i.test(String(e?.message ?? ''));
+      result.notes.push(
+        overloaded
+          ? 'civitai 的图片搜索接口暂时过载（503；实测约一半的请求会遇到），重试若干次仍未成功 —— 反应任务本轮跳过，稍后重新扫描即可。'
+          : `拉取图片池失败（${describeError(e)}）——本轮无法执行反应任务。`,
+      );
     }
 
     // 5.5) 官方任务定义 —— 采信官方返回的 awardAmount / cap，覆盖本地常量。
@@ -347,8 +354,8 @@ export class BuzzEngine {
           reason: remainCount === 0
             ? `今日反应额度已满（站点侧已得 ${used}/${ceilingCount} 次，含手动操作）`
             : freshPool.length === 0
-              ? `候选图里没有未点过的（池子 ${pool.length} 条，今日已点 ${reactedToday.size} 张）`
-              : `站点侧今日已得 ${used}/${ceilingCount} 次，计划 ${need} 次（未点过 ${freshPool.length} / 池子 ${pool.length} 条）`,
+              ? `游标之后没有可取的新图了（本次拉到 ${pool.length} 条，游标 id=${cursor}）`
+              : `站点侧今日已得 ${used}/${ceilingCount} 次，计划 ${need} 次（游标 id=${cursor} 之后可取 ${freshPool.length} 张）`,
         }),
       );
     }
@@ -622,35 +629,54 @@ export class BuzzEngine {
     const need = item?.plannedCount ?? 0;
     if (need <= 0) return { earned: 0, skipped: '无计划次数' };
 
-    emit({ kind: 'step', type: 'encouragement', message: `拉取目标图片（需要 ${need} 张）` });
+    emit({ kind: 'step', type: 'encouragement', message: `按游标取目标图（需要 ${need} 张）` });
 
-    // 拉大一点（200）再随机抽：热门榜头部是高度稳定的一批图，长期只取前 N 张，
-    // 必然和用户自己浏览时点过的重叠 —— 而那些点过了就不再给奖励。
-    const list = await client.listImages({ limit: 200, sort: 'Most Reactions', period: 'Month' });
-    const items = Array.isArray(list?.items) ? list.items : [];
+    // 游标推进法：只取 id > 游标的图，按 id 升序点完，游标前移。
+    // 状态只有一个数字，天然不重复 —— 因为站点对同一张图的奖励永久只发一次。
+    const cursor = store.getReactionCursor(accountId);
     const me = account.profile?.username?.toLowerCase();
-    const pool = items.filter((i) => i?.id && (!me || i.username?.toLowerCase() !== me));
+    let list;
+    try {
+      list = await client.listImages({ limit: 200, sort: 'Newest' });
+    } catch (e) {
+      const overloaded = e?.status === 503 || /overloaded|retry/i.test(String(e?.message ?? ''));
+      return {
+        earned: 0,
+        error: overloaded
+          ? 'civitai 图片搜索接口过载（503），重试后仍未成功，稍后再试'
+          : `拉取图片池失败：${describeError(e)}`,
+      };
+    }
+    const pool = (Array.isArray(list?.items) ? list.items : []).filter(
+      (i) => i?.id && (!me || i.username?.toLowerCase() !== me),
+    );
     if (!pool.length) return { earned: 0, error: '图片池为空，无法取得反应目标' };
 
-    // 排除「今天已经点过」的图。站点对同一张图同一天只发一次奖励，
-    // 重复点拿不到 buzz，却会在别人内容上留下真实的赞 —— 只有副作用，没有收益。
-    let usedIds = new Set();
+    // 本地按 id 升序取「游标之后最旧的那批」：稳步推进、不会漏、也不会重复
+    const afterCursor = pool.filter((i) => i.id > cursor).sort((a, b) => a.id - b.id);
+
+    // 再扣除今日流水里点过的（用户手动操作的那些，游标看不到）
+    const todayReacted = new Set();
     try {
-      usedIds = reactedImageIds(await client.transactionsOfDay(ctx.plan?.utcDay));
-    } catch { /* 读不到流水就不排除，退化为纯随机抽样 */ }
-    const fresh = pool.filter((i) => !usedIds.has(i.id));
-    if (usedIds.size) {
-      emit({
-        kind: 'step',
-        type: 'encouragement',
-        message: `已排除今日点过的 ${usedIds.size} 张图，可用候选 ${fresh.length} 张`,
-      });
-    }
+      for (const id of reactedImageIds(await client.transactionsOfDay(ctx.plan?.utcDay))) {
+        todayReacted.add(id);
+      }
+    } catch { /* 读不到不影响主流程 */ }
+    const fresh = afterCursor.filter((i) => !todayReacted.has(i.id));
+
+    emit({
+      kind: 'step',
+      type: 'encouragement',
+      message: `拉到 ${pool.length} 条，游标 id=${cursor} 之后 ${afterCursor.length} 条，扣今日已点 ${todayReacted.size} 条 → 可用 ${fresh.length} 条`,
+    });
     if (!fresh.length) {
-      return { earned: 0, skipped: `候选图今天都已点过（${pool.length} 张），重复点不会产生奖励` };
+      return {
+        earned: 0,
+        skipped: `游标之后没有可取的新图（游标 id=${cursor}，本次拉到 ${pool.length} 条）`,
+      };
     }
-    // 随机抽样，而不是按热度顺序取头部
-    const targets = shuffle(fresh).slice(0, need);
+    // 取最旧的 need 张（顺序推进），而不是随机挑
+    const targets = fresh.slice(0, need);
 
     let earned = 0;
     let count = 0;
@@ -681,9 +707,14 @@ export class BuzzEngine {
         await sleep(randInt(settings.reactionDelayMinMs, settings.reactionDelayMaxMs));
       }
     }
+    // 游标前移到本次点过的最大 id —— 无论是否到账都要推进：
+    // 没到账的说明这张图以前点过，更不该再碰。游标只增不减。
+    const maxId = targets.reduce((m, t) => Math.max(m, t.id), 0);
+    const newCursor = store.setReactionCursor(accountId, maxId);
+
     return {
       earned,
-      detail: { reacted: count, target: need },
+      detail: { reacted: count, target: need, cursor: newCursor },
       ...(errors.length ? { warnings: errors.slice(0, 5) } : {}),
     };
   }

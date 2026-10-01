@@ -179,14 +179,27 @@ export class CivitaiClient {
    * 而流水直接给出每一笔奖励的类型与金额。
    */
   async transactionsOfDay(utcDay) {
-    const start = `${utcDay}T00:00:00.000Z`;
-    const end = `${utcDay}T23:59:59.999Z`;
+    return this.transactionsOfRange(`${utcDay}T00:00:00.000Z`, `${utcDay}T23:59:59.999Z`);
+  }
+
+  /**
+   * 任意区间的 buzz 流水（单次上限 200 条）。
+   * 回溯历史用 —— 站点的奖励去重是**永久**的，所以要能查更早的记录。
+   */
+  async transactionsOfRange(startIso, endIso, limit = 200) {
     const res = await this.queryWithDates(
       'buzz.getUserTransactions',
-      { start, end, limit: 200 },
+      { start: startIso, end: endIso, limit },
       ['start', 'end'],
     );
     return Array.isArray(res?.transactions) ? res.transactions : [];
+  }
+
+  /** 最近 N 天的流水。 */
+  async recentTransactions(days = 30) {
+    const end = new Date();
+    const start = new Date(end.getTime() - days * 86400000);
+    return this.transactionsOfRange(start.toISOString(), end.toISOString());
   }
 
   // ───────────────────────── 账号 ─────────────────────────
@@ -242,7 +255,36 @@ export class CivitaiClient {
 
   // ───────────────────── 数据源（公开接口） ─────────────────────
 
-  /** 热门图片，作为 reaction 的目标池。 */
+  /**
+   * 简单退避重试。只对 5xx 与网络抖动重试；4xx 是请求本身的问题，重试没有意义。
+   */
+  async #retry(fn, attempts = 3, baseDelayMs = 1500) {
+    let lastErr;
+    for (let i = 0; i < attempts; i += 1) {
+      try {
+        return await fn();
+      } catch (e) {
+        lastErr = e;
+        const status = e?.status ?? 0;
+        if (status >= 400 && status < 500) throw e;
+        if (i < attempts - 1) await new Promise((r) => setTimeout(r, baseDelayMs * (i + 1)));
+      }
+    }
+    throw lastErr;
+  }
+
+  /**
+   * 热门图片，作为 reaction 的目标池。
+   *
+   * 带退避重试，因为这个接口会**高频**返回 503：
+   *   {"error":"Image search is temporarily overloaded — please retry."}
+   * 实测连续 6 次里有 3 次 503（约 50%），且同一请求紧接着重试通常就 200 ——
+   * 站点侧过载限流，不是请求本身的问题（它自己的文案就在说 please retry）。
+   *
+   * 重试次数不能小气：按 50% 失败率算，重试 4 次仍有 ~6% 概率全军覆没，
+   * 那一轮的反应任务（当天 100 buzz 的主力项）就白白丢了。这里给 6 次 +
+   * 递增退避，全失败概率降到 ~1.6%，且失败时能明确报出是站点过载。
+   */
   async listImages({ limit = 100, sort = 'Most Reactions', period = 'Month' } = {}) {
     const qs = new URLSearchParams({
       limit: String(limit),
@@ -250,7 +292,8 @@ export class CivitaiClient {
       period,
       nsfw: 'false',
     });
-    return this.#request(`${this.#base}/api/v1/images?${qs}`, { method: 'GET' });
+    const url = `${this.#base}/api/v1/images?${qs}`;
+    return this.#retry(() => this.#request(url, { method: 'GET' }), 6, 2000);
   }
 
   /** 通过用户名取用户 id（follow 的目标解析）。 */
